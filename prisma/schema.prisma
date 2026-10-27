@@ -1,0 +1,30 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Order {
+  id         Int      @id @default(autoincrement())
+  customerId Int      @map("customer_id")
+  country    String   @db.VarChar(2)
+  items      Int
+  unitCents  Int      @map("unit_cents")
+  note       String
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([country])
+  @@map("orders")
+}
+
+model User {
+  id           Int    @id @default(autoincrement())
+  username     String @unique
+  salt         String
+  passwordHash String @map("password_hash")
+
+  @@map("users")
+}

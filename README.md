@@ -1,103 +1,84 @@
-# Node Lab 01 — The Event Loop
+# Node Lab 01 — The Event Loop (NestJS + Prisma + Postgres)
 
-> Interview question this lab trains: **"How does the Node.js event loop work, and what happens when you block it?"**
+> Interview question: **"How does the Node.js event loop work, and what happens when you block it?"**
 
-You will (1) prove you can predict event-loop ordering and (2) fix a real HTTP server that freezes
-under load because it blocks the loop. Everything you need (data generator, broken server, benchmark)
-is already here. Focus on the solution.
+## The scenario
+
+You maintain the back-office API of an e-commerce company (NestJS, Prisma, Postgres). Every
+morning the managers open the sales dashboard, which calls `GET /reports/sales`. Since the orders
+table grew to 300k rows, the whole API "freezes" for seconds whenever someone opens it: the health
+check fails, Kubernetes restarts the pod, logins time out. Ops is blaming "Node being
+single-threaded". Your job is to fix it.
 
 ## Setup
 
 ```bash
-npm install          # no dependencies, but keeps the workflow familiar
-npm run seed         # generates server/data/orders.ndjson (~65 MB, 400k orders) + expected.json
+npm install            # also runs `prisma generate`
+cp .env.example .env
+npm run db:up          # Postgres 16 on localhost:5441 (docker compose)
+npm run db:setup       # applies migrations and seeds 300k orders + user alice/secret (~20 s)
+npm run start:dev      # API on :3000
+npm run bench          # another terminal — watch /health latency go to seconds
 ```
 
-Requires Node 20+.
+Requires Node 20+ and Docker.
 
-## Part 1 — Predict the output (`puzzles/`)
+## Project structure
 
-Each file in `puzzles/` prints a few lines. **Without running them**, write the exact output order
-in `puzzles/answers.json`, e.g.:
-
-```json
-{ "01-basics.cjs": ["A", "E", "D", "C", "B"], ... }
+```
+prisma/schema.prisma                     Order, User
+prisma/seed.ts                           300k deterministic orders, user alice
+src/
+  prisma/prisma.service.ts               PrismaClient as an injectable (global module)
+  health/health.controller.ts            GET  /health
+  reports/reports.service.ts             GET  /reports/sales   ← loads 300k rows into Node and loops over them
+  auth/auth.service.ts                   POST /auth/login      ← pbkdf2Sync on the main thread
+scripts/bench.mjs                        load test; computes the expected report with SQL
+puzzles/                                 optional warm-up on event-loop ordering
 ```
 
-Then verify:
+## Your task
 
-```bash
-npm run check:puzzles
-```
+Make `ReportsService` and `AuthService` stop blocking the event loop, without changing the HTTP
+contract. The benchmark runs 10 concurrent `/reports/sales` and 10 concurrent `/auth/login`
+clients while probing `/health` every 50 ms.
 
-Concepts you must be able to explain for each puzzle:
-
-| Puzzle | Concept |
-|---|---|
-| 01 | Sync code → `process.nextTick` queue → Promise microtasks → timers |
-| 02 | The nextTick queue is drained fully before microtasks, and Node alternates between them until both are empty |
-| 03 | Event-loop phases: timers → pending callbacks → poll → check (`setImmediate`) → close. Why is `setTimeout(0)` vs `setImmediate` only deterministic inside an I/O callback? |
-| 04 | `async/await` is Promises; every `await` yields to the microtask queue |
-| 05 | Same code as 01 but as an ES module gives a different order. Why? |
-
-Write your explanation for puzzle 05 in a short `NOTES.md` (2–5 sentences).
-
-## Part 2 — Unblock the server (`server/server.js`)
-
-The server exposes three endpoints:
-
-| Endpoint | What it does | Why it is broken |
-|---|---|---|
-| `GET /health` | returns `{ ok: true }` | nothing wrong — but it becomes unresponsive because the other handlers block the loop |
-| `GET /report` | aggregates all orders from `orders.ndjson` | `readFileSync` + parsing a 65 MB file synchronously + a busy-wait "rate limiter" |
-| `POST /login` | verifies a password with PBKDF2 | `pbkdf2Sync` runs 100k iterations on the main thread |
-
-See it fail:
-
-```bash
-npm start          # terminal 1
-npm run bench      # terminal 2 → /health p99 will be in the seconds
-```
-
-### Your task
-
-Rewrite `server/server.js` so that it **never blocks the event loop**, keeping the exact same
-HTTP contract (same paths, methods, status codes and JSON bodies).
-
-Hints (you don't have to use all of them):
-
-- Replace `readFileSync` + `split('\n')` with a stream and `readline` (the file is NDJSON on purpose).
-- Replace the busy-wait with a timer-based delay (the 100 ms delay must stay — a client should still
-  observe it).
-- Use the async `crypto.pbkdf2` — which thread actually does the work then? Look up `UV_THREADPOOL_SIZE`.
-- Think about whether the report needs to be recomputed on every request. Caching with
-  invalidation on file `mtime` is a valid optimization, but the first request must still not block.
-- `/login` must keep returning `{ ok: true }` for `alice` / `secret`.
+Hints:
+- `findMany()` is async, but turning 300k rows into JavaScript objects and looping over them is
+  synchronous CPU work. Who should do the aggregation: Node or Postgres? Look at Prisma's
+  `groupBy` / `aggregate`, or `$queryRaw`.
+- If you ever really need every row (e.g. a CSV export), don't load them all at once: paginate with
+  a cursor and stream the response.
+- `crypto.pbkdf2` has an async version. Which thread runs it then? What is `UV_THREADPOOL_SIZE`?
 
 ### Acceptance criteria
 
-Run `npm run check` (puzzles + benchmark). All of the following must be green while the benchmark is
-hammering the server with 10 concurrent `/report` and 10 concurrent `/login` loops for 15 seconds:
+`npm run bench` must be all green:
 
-- [ ] All 5 puzzles correctly predicted in `puzzles/answers.json`
-- [ ] `NOTES.md` explains the ESM twist (puzzle 05)
-- [ ] `/health` p99 latency < 50 ms under load
-- [ ] `/health` max latency < 250 ms under load
-- [ ] `/report` returns the exact same totals as `server/data/expected.json` every time
-- [ ] `/report` completes at least 5 requests during the run
-- [ ] `/login` has zero errors
-- [ ] No `*Sync` call from `fs` or `crypto` remains in the request path (`grep -n Sync server/server.js`)
+- [ ] `/health` p99 < 50 ms and max < 250 ms while under load
+- [ ] `/reports/sales` matches the SQL aggregate computed by the benchmark, every time
+- [ ] `/reports/sales` completes at least 20 requests in the 15 s run
+- [ ] `/auth/login` has zero errors (`alice` / `secret` still logs in)
+- [ ] No `pbkdf2Sync` and no full-table `findMany()` in `src/` (`grep -rn "Sync\|findMany()" src/`)
+- [ ] Short `NOTES.md`: what was blocking, why `/health` suffered although it does nothing, and
+      how you'd detect this in production (event-loop lag metric)
 
-### Stretch goals
+### Stretch goal
 
-- Add a `/metrics` endpoint that reports event-loop lag (`perf_hooks.monitorEventLoopDelay`) and show the
-  before/after numbers in `NOTES.md`.
-- Run the benchmark with `UV_THREADPOOL_SIZE=1` and `UV_THREADPOOL_SIZE=16` and explain what changes
-  for `/login`.
+Add `GET /reports/orders.csv` that streams all 300k orders as CSV using cursor pagination
+(`take` + `cursor`) and a Node `Readable`, keeping `/health` responsive and memory flat.
+
+### Warm-up (optional, ~10 min): predict the output
+
+`puzzles/` has 5 tiny scripts. Write the exact output order in `puzzles/answers.json` without
+running them, then `npm run check:puzzles`. They cover nextTick vs microtasks vs timers,
+`setTimeout(0)` vs `setImmediate`, `async/await`, and why the same code behaves differently as an
+ES module (puzzle 05). Interviewers love these.
 
 ## What a senior answer sounds like
 
-After finishing, you should be able to explain in your own words: the phases of the loop, the
-difference between `nextTick`, microtasks and macrotasks, why "Node is single-threaded" is only
-half true (libuv thread pool, worker threads), and how to detect a blocked loop in production
-(event-loop lag metrics, `--cpu-prof`, `clinic doctor`).
+Node runs your JavaScript on one thread; I/O is handled by libuv and comes back through the event
+loop phases. Anything synchronous and long — materializing huge result sets, big `JSON.parse`,
+`*Sync` crypto/fs calls, tight loops — stalls *every* request, including the health check. Push
+aggregation to the database, stream big exports, use the async APIs (thread pool) or a worker
+(Lab 02), and measure event-loop lag (`perf_hooks.monitorEventLoopDelay`) in production.

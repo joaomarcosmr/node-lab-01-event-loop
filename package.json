@@ -1,0 +1,14 @@
+{
+  "name": "node-lab-01-event-loop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "seed": "node scripts/seed.js",
+    "start": "node server/server.js",
+    "check:puzzles": "node scripts/check-puzzles.js",
+    "bench": "node scripts/bench.js",
+    "check": "npm run check:puzzles && npm run bench"
+  }
+}
